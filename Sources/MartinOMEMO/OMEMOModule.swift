@@ -24,6 +24,7 @@ import Martin
 import libsignal
 import Combine
 import CryptoKit
+import TigaseLogging
 
 extension XmppModuleIdentifier {
     public static var omemo: XmppModuleIdentifier<OMEMOModule> {
@@ -55,6 +56,8 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
     
     public let id: String = ID;
 
+    private let logger = Logger(subsystem: "TigaseSwiftOMEMO", category: "OMEMOModule")
+    
     // Default body to set for OMEMO encrypted messages
     open var defaultBody: String? = "I sent you an OMEMO encrypted message but your client doesn’t seem to support that.";
     
@@ -247,7 +250,7 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
             
             let key = SymmetricKey(data: decodedKey);
             guard let decoded = try? AES.GCM.open(sealed, using: key) else {
-                print("decoding of encrypted message failed!");
+                logger.error("decoding of encrypted message failed!");
                 throw SignalError.invalidMac;
             }
             
@@ -519,7 +522,7 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
                 do {
                     _ = try await pubsubModule.publishItem(at: jid, to: OMEMOModule.DEVICES_LIST_NODE, itemId: "current", payload: listEl!, publishOptions: publishOptions);
                     self.isReady = true;
-                    print("device id:", ourDeviceIdStr, " successfully registered!");
+                    logger.debug("device id: \(ourDeviceIdStr) successfully registered!");
                 } catch let error as XMPPError {
                     guard error.condition == .conflict else {
                         return;
@@ -532,13 +535,13 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
                             _ = try? await pubsubModule.publishItem(at: jid, to: OMEMOModule.DEVICES_LIST_NODE, itemId: "current", payload: listEl!, publishOptions: publishOptions);
                             self.isReady = true;
                         } catch {
-                            print("node reconfiguration failed! \(error)");
+                            logger.error("node reconfiguration failed! \(error)");
                         }
                     } catch {
-                        print("node configuration retrieval failed! \(error)");
+                        logger.debug("node configuration retrieval failed! \(error)");
                     }
                 } catch {
-                    print("could not publish devices list: \(error)");
+                    logger.error("could not publish devices list: \(error)");
                 }
             } else {
                 self.isReady = true;
@@ -648,7 +651,7 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
         
         if signedPreKey == nil {
             let identityKeyPair = storage.identityKeyStore.keyPair()!;
-            print("regenerating signed pre key!");
+            logger.info("regenerating signed pre key!");
             signedPreKey = signalContext.generateSignedPreKey(withIdentity: identityKeyPair, signedPreKeyId: UInt32(signedPreKeyId + 1))
             guard signedPreKey != nil else {
                 return nil;
@@ -739,7 +742,7 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
             message.hints = [.store];
             self.write(stanza: message);
         } catch {
-            print("failed to complete session for address: \(address), error: \(error)");
+            logger.error("failed to complete session for address: \(address), error: \(error)");
         }
     }
     
@@ -751,7 +754,7 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
         do {
             let items = try await pubsubModule.retrieveItems(from: pepJid, for: bundleNode(for: UInt32(bitPattern: address.deviceId)), limit: .lastItems(1));
             guard let bundle = OMEMOBundle(from: items.items.first?.payload) else {
-                print("could not create a bundle!");
+                logger.debug("could not create a bundle!");
                 await state.markDeviceFailed(for: pepJid, deviceId: address.deviceId);
                 return;
             }
@@ -760,15 +763,15 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
             if let preKeyBundle = SignalPreKeyBundle(registrationId: 0, deviceId: address.deviceId, preKey: preKey, bundle: bundle) {
                 if let builder = SignalSessionBuilder(withAddress: address, andContext: self.signalContext) {
                     if builder.processPreKeyBundle(bundle: preKeyBundle) {
-                        print("signal session established!");
+                        logger.debug("signal session established!");
                     } else {
-                        print("building session failed!");
+                        logger.error("building session failed!");
                     }
                 } else {
-                    print("unable to create builder!");
+                    logger.error("unable to create builder!");
                 }
             } else {
-                print("unable to create pre key bundle!");
+                logger.error("unable to create pre key bundle!");
                 await state.markDeviceFailed(for: pepJid, deviceId: address.deviceId);
             }
         } catch {

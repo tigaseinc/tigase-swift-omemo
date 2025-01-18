@@ -30,7 +30,13 @@ open class SignalStorage {
     public let identityKeyStore: SignalIdentityKeyStoreProtocol;
     public let senderKeyStore: SignalSenderKeyStoreProtocol;
     
-    fileprivate(set) var storeContext: OpaquePointer?;
+    fileprivate(set) var storeContext: OpaquePointer? {
+        willSet {
+            if let storeContext {
+                signal_protocol_store_context_destroy(storeContext);
+            }
+        }
+    }
     
     public init(sessionStore: SignalSessionStoreProtocol, preKeyStore: SignalPreKeyStoreProtocol, signedPreKeyStore: SignalSignedPreKeyStoreProtocol, identityKeyStore: SignalIdentityKeyStoreProtocol, senderKeyStore: SignalSenderKeyStoreProtocol) {
         self.sessionStore = sessionStore;
@@ -41,9 +47,6 @@ open class SignalStorage {
     }
     
     deinit {
-        if storeContext != nil {
-            signal_protocol_store_context_destroy(storeContext);
-        }
         storeContext = nil;
     }
     

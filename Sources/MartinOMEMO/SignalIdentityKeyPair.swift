@@ -87,6 +87,8 @@ open class SignalIdentityKeyPair: SignalIdentityKeyProtocol, SignalIdentityKeyPa
 
         var pointer: OpaquePointer?;
         ec_key_pair_create(&pointer, publicKeyPointer, privateKeyPointer);
+        signal_type_unref(publicKeyPointer)
+        signal_type_unref(privateKeyPointer)
         guard let pointer = pointer else {
             return nil;
         }
@@ -95,7 +97,6 @@ open class SignalIdentityKeyPair: SignalIdentityKeyProtocol, SignalIdentityKeyPa
     }
     
     public init(withKeyPairPointer keyPairPointer: OpaquePointer) {
-        signal_type_ref(keyPairPointer);
         self.keyPairPointer = keyPairPointer;
     }
     
