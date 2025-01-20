@@ -136,6 +136,40 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
         return try self.decrypt(message: message, from: from, serverMsgId: serverMsgId)
     }
     
+    public struct DecryptedKey {
+        let data: Data;
+        let address: SignalAddress;
+        let isPreKey: Bool
+    }
+    
+    public func decryptKey(possibleKeys: [SignalSessionCipher.Key], senderAddress: SignalAddress, context: Context, storage: SignalStorage, healFn: @escaping ()->Void) throws -> DecryptedKey? {
+        guard !possibleKeys.isEmpty else {
+            return nil;
+        }
+        
+        let cipher = try SignalSessionCipher(withAddress: senderAddress, andContext: self.signalContext);
+        for key in possibleKeys {
+            do {
+                let decodedKey = try cipher.decrypt(key: key);
+                return .init(data: decodedKey, address: senderAddress, isPreKey: key.prekey);
+            } catch {
+                logger.error("failed to decrypt key from: \(senderAddress): \(error)")
+                switch error as? SignalError {
+                case .invalidMessage, .noSession:
+                    healFn();
+                default:
+                    break;
+                }
+                if possibleKeys.last == key {
+                    throw error;
+                }
+            }
+        }
+        
+        // FIXME: this should not happen!!
+        fatalError("Didn't throw and did not return value!")
+    }
+        
     public func decrypt(message: Message, from: BareJID, serverMsgId: String? = nil) throws -> DecryptionResult {
         guard let context = context, let storage = signalContext.storage else {
             throw SignalError.unknown;
@@ -150,10 +184,31 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
         }
         
         let localDeviceIdStr = String(storage.identityKeyStore.localRegistrationId());
-        
-        guard headerEl.firstChild(where: { (el) -> Bool in
+                
+        let possibleKeys = headerEl.filterChildren(where: { (el) -> Bool in
             return el.name == "key" && el.attribute("rid") == localDeviceIdStr;
-        }) != nil else {
+        }).compactMap({ keyEl -> SignalSessionCipher.Key? in
+            let prekey = "true" == keyEl.attribute("prekey") || keyEl.attribute("prekey") == "1";
+            guard let keyElValue = keyEl.value, let key = Data(base64Encoded: keyElValue) else {
+                return nil;
+            }
+            return SignalSessionCipher.Key(key: key, deviceId: Int32(bitPattern: sid), prekey: prekey);
+        })
+        
+        let senderAddress = SignalAddress(name: from.description, deviceId: Int32(bitPattern: sid));
+        let healFn = {
+            if serverMsgId != nil {
+                Task {
+                    let isPostponed = await self.state.postponedHealing(for: message.type == .groupchat ? message.from?.bareJid : nil, address: senderAddress)
+                    if !isPostponed {
+                        await self.buildSession(forAddress: senderAddress);
+                        self.completeSession(forAddress: senderAddress);
+                    }
+                }
+            }
+        }
+        
+        guard let decryptedKey = try decryptKey(possibleKeys: possibleKeys, senderAddress: senderAddress, context: context, storage: storage, healFn: healFn) else {
             guard context.userBareJid != from || sid != storage.identityKeyStore.localRegistrationId() else {
                 throw SignalError.duplicateMessage;
             }
@@ -163,107 +218,58 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
             throw SignalError.invalidMessage;
         }
         
-        let possibleKeys = headerEl.filterChildren(where: { (el) -> Bool in
-            return el.name == "key" && el.attribute("rid") == localDeviceIdStr;
-        }).map({ (keyEl) -> KeyDecryptionResult in
-            let prekey = "true" == keyEl.attribute("prekey") || keyEl.attribute("prekey") == "1";
-            let address = SignalAddress(name: from.description, deviceId: Int32(bitPattern: sid));
-            guard let keyElValue = keyEl.value, let key = Data(base64Encoded: keyElValue) else {
-                return .init(result: .failure(.invalidArgument), address: address, isPrekey: prekey);
-            }
-            guard let session = SignalSessionCipher(withAddress: address, andContext: self.signalContext) else {
-                return .init(result: .failure(SignalError.noMemory), address: address, isPrekey: prekey);
-            }
-            return .init(result: session.decrypt(key: SignalSessionCipher.Key(key: key,deviceId: Int32(bitPattern: sid), prekey: prekey)), address: address, isPrekey: prekey);
-        });
-        
-        guard let possibleKey = possibleKeys.first(where: { $0.isSuccess }) else {
-            if let key = possibleKeys.first {
-                switch key.result {
-                case .failure(let error):
-                    switch error {
-                    case .noSession, .invalidMessage:
-                        if serverMsgId != nil {
-                            Task {
-                                let isPostponed = await state.postponedHealing(for: message.type == .groupchat ? message.from?.bareJid : nil, address: key.address)
-                                if !isPostponed {
-                                    await self.buildSession(forAddress: key.address);
-                                    self.completeSession(forAddress: key.address);
-                                }
-                            }
-                        }
-                    default:
-                        break;
-                    }
-                    throw error;
-                case .success(_):
-                    throw SignalError.unknown;
-                }
-            } else {
-                guard encryptedEl.hasChild(name: "payload") else {
-                    throw SignalError.duplicateMessage;
-                }
-                throw SignalError.invalidMessage;
-            }
+        guard let ivStr = headerEl.firstChild(name: "iv")?.value, let iv = Data(base64Encoded: ivStr) else {
+            throw SignalError.invalidArgument;
         }
         
-        switch possibleKey.result {
-        case .failure(let error):
-            throw error;
-        case .success(let data):
-            message.removeChild(encryptedEl);
-
-            let address = possibleKey.address;
-            let prekey = possibleKey.isPrekey;
-            var decodedKey = data;
-            
-            if prekey {
-                // pre key was removed so we need to republish the bundle!
-                Task {
-                    let isPostponed = await state.postponedSession(for: message.type == .groupchat ? message.from?.bareJid : nil, address: address)
-                    if !isPostponed {
-                        if self.storage.preKeyStore.flushDeletedPreKeys() {
-                            try? await self.publishDeviceBundleIfNeeded();
-                        }
+        guard let payloadValue = encryptedEl.firstChild(name: "payload")?.value, let payload = Data(base64Encoded: payloadValue) else {
+            return .transportKey(TransportKey(key: decryptedKey.data, iv: iv));
+        }
+        
+        if decryptedKey.isPreKey {
+            // pre key was removed so we need to republish the bundle!
+            Task {
+                let isPostponed = await state.postponedSession(for: message.type == .groupchat ? message.from?.bareJid : nil, address: decryptedKey.address)
+                if !isPostponed {
+                    if self.storage.preKeyStore.flushDeletedPreKeys() {
+                        try? await self.publishDeviceBundleIfNeeded();
                     }
                 }
             }
-
-            var auth = Data();
-            if decodedKey.count >= 32 {
-                auth = decodedKey.subdata(in: 16..<decodedKey.count);
-                decodedKey = decodedKey.subdata(in: 0..<16);
-            }
-            
-            
-            guard let ivStr = headerEl.firstChild(name: "iv")?.value, let iv = Data(base64Encoded: ivStr) else {
-                throw SignalError.invalidArgument;
-            }
-            
-            guard let payloadValue = encryptedEl.firstChild(name: "payload")?.value, let payload = Data(base64Encoded: payloadValue) else {
-                return .transportKey(TransportKey(key: decodedKey, iv: iv));
-            }
-
-            guard let sealed = try? AES.GCM.SealedBox(nonce: AES.GCM.Nonce(data: iv), ciphertext: payload, tag: auth) else {
-                throw SignalError.invalidArgument;
-            }
-            
-            let key = SymmetricKey(data: decodedKey);
-            guard let decoded = try? AES.GCM.open(sealed, using: key) else {
-                logger.error("decoding of encrypted message failed!");
-                throw SignalError.invalidMac;
-            }
-            
-            let body = String(data: decoded, encoding: .utf8);
-            message.body = body;
-            
-            if let content = body, content.starts(with: "aesgcm://"), URLComponents(string: content) != nil {
-                message.oob = content;
-            }
-
-            _ = storage.identityKeyStore.setStatus(active: true, forIdentity: address);
-            return .message(DecryptedMessage(message: message, fingerprint: storage.identityKeyStore.identityFingerprint(forAddress: address)));
         }
+
+        let body = try decrypt(payload: payload, iv: iv, key: decryptedKey);
+        message.removeChild(encryptedEl);
+        message.body = body;
+        
+        if let content = body, content.starts(with: "aesgcm://"), URLComponents(string: content) != nil {
+            message.oob = content;
+        }
+
+        _ = storage.identityKeyStore.setStatus(active: true, forIdentity: senderAddress);
+        return .message(DecryptedMessage(message: message, fingerprint: storage.identityKeyStore.identityFingerprint(forAddress: senderAddress)));
+    }
+    
+    private func decrypt(payload: Data, iv: Data, key: DecryptedKey) throws -> String? {
+        var decodedKey = key.data;
+        
+        var auth = Data();
+        if decodedKey.count >= 32 {
+            auth = decodedKey.subdata(in: 16..<decodedKey.count);
+            decodedKey = decodedKey.subdata(in: 0..<16);
+        }
+        
+        guard let sealed = try? AES.GCM.SealedBox(nonce: AES.GCM.Nonce(data: iv), ciphertext: payload, tag: auth) else {
+            throw SignalError.invalidArgument;
+        }
+        
+        let key = SymmetricKey(data: decodedKey);
+        guard let decoded = try? AES.GCM.open(sealed, using: key) else {
+            logger.error("decoding of encrypted message failed!");
+            throw SignalError.invalidMac;
+        }
+        
+        return String(data: decoded, encoding: .utf8);
     }
     
     public func encrypt(message: Message, withStoreHint: Bool = true) async throws -> EncryptedMessage {
@@ -398,28 +404,24 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
             return SignalAddress(name: context.userBareJid.description, deviceId: deviceId);
         }) : [];
         let destinations: Set<SignalAddress> = Set(remoteAddresses + localAddresses);
-        header.addChildren(destinations.map({ (addr) -> Result<SignalSessionCipher.Key,SignalError> in
-                // TODO: maybe we should cache this session?
-                guard let session = SignalSessionCipher(withAddress: addr, andContext: self.signalContext) else {
-                    // FIXME: is this causing an error?
-                    return .failure(.noMemory);
-                }
-                return session.encrypt(data: combinedKey);
-            }).compactMap({ (result) -> Element? in
-                switch result {
-                case .success(let key):
-                    let keyEl = Element(name: "key", cdata: key.key.base64EncodedString());
-                    keyEl.attribute("rid", newValue: String(key.deviceId));
-                    if key.prekey {
-                        keyEl.attribute("prekey", newValue: "true");
-                    }
-                    return keyEl;
-                case .failure(_):
-                    // FIXME: is this causing an error?
-                    return nil;
-                }
-            }));
-            header.addChild(Element(name: "iv", cdata: Data(sealed.nonce).base64EncodedString()));
+        header.addChildren(destinations.compactMap({ addr -> SignalSessionCipher.Key? in
+            // TODO: maybe we should cache this session?
+            do {
+                let cipher = try SignalSessionCipher(withAddress: addr, andContext: self.signalContext);
+                return try cipher.encrypt(data: combinedKey);
+            } catch {
+                self.logger.error("Failed to encrypt key for \(addr): \(error)")
+                return nil;
+            }
+        }).compactMap({ (key: SignalSessionCipher.Key) -> Element? in
+            let keyEl = Element(name: "key", cdata: key.key.base64EncodedString());
+            keyEl.attribute("rid", newValue: String(key.deviceId));
+            if key.prekey {
+                keyEl.attribute("prekey", newValue: "true");
+            }
+            return keyEl;
+        }));
+        header.addChild(Element(name: "iv", cdata: Data(sealed.nonce).base64EncodedString()));
 
         message.body = nil;
         message.addChild(Element(name: "store", xmlns: "urn:xmpp:hints"));
@@ -760,17 +762,15 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
             }
         
             let preKey = bundle.preKeys[Int.random(in: 0..<bundle.preKeys.count)];
-            if let preKeyBundle = SignalPreKeyBundle(registrationId: 0, deviceId: address.deviceId, preKey: preKey, bundle: bundle) {
-                if let builder = SignalSessionBuilder(withAddress: address, andContext: self.signalContext) {
-                    if builder.processPreKeyBundle(bundle: preKeyBundle) {
-                        logger.debug("signal session established!");
-                    } else {
-                        logger.error("building session failed!");
-                    }
-                } else {
-                    logger.error("unable to create builder!");
+            do {
+                let preKeyBundle = try SignalPreKeyBundle(registrationId: 0, deviceId: address.deviceId, preKey: preKey, bundle: bundle)
+                do {
+                    let builder = try SignalSessionBuilder(withAddress: address, andContext: self.signalContext);
+                    try builder.processPreKeyBundle(bundle: preKeyBundle);
+                } catch {
+                    logger.error("building session failed: \(error)");
                 }
-            } else {
+            } catch {
                 logger.error("unable to create pre key bundle!");
                 await state.markDeviceFailed(for: pepJid, deviceId: address.deviceId);
             }

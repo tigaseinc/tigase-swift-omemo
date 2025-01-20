@@ -28,24 +28,28 @@ open class SignalSessionBuilder {
     fileprivate let address: SignalAddress;
     fileprivate let context: SignalContext;
     
-    init?(withAddress addr: SignalAddress, andContext ctx: SignalContext) {
+    init(withAddress addr: SignalAddress, andContext ctx: SignalContext) throws {
         var builder: OpaquePointer?;
-        guard let storage = ctx.storage, session_builder_create(&builder, storage.storeContext!, addr.address, ctx.globalContext) >= 0 && builder != nil else {
-            return nil;
+        guard let storage = ctx.storage else {
+            fatalError("Storage not initialized")
         }
-        self.address = addr;
-        self.context = ctx;
-        self.builder = builder!;
+        guard let error = SignalError.from(code: session_builder_create(&builder, storage.storeContext!, addr.address, ctx.globalContext)) else {
+            self.address = addr;
+            self.context = ctx;
+            self.builder = builder!;
+            return;
+        }
+        throw error;
     }
  
     deinit {
         session_builder_free(builder);
     }
     
-    func processPreKeyBundle(bundle: SignalPreKeyBundle) -> Bool {
-        guard session_builder_process_pre_key_bundle(builder, bundle.bundle) >= 0 else {
-            return false;
+    func processPreKeyBundle(bundle: SignalPreKeyBundle) throws {
+        guard let error = SignalError.from(code: session_builder_process_pre_key_bundle(builder, bundle.bundle)) else {
+            return;
         }
-        return true;
+        throw error;
     }
 }

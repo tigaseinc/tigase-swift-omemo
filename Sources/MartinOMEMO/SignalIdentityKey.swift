@@ -23,16 +23,6 @@ import Foundation
 import libsignal
 
 open class SignalIdentityKey: SignalIdentityKeyProtocol {
-
-    public static func publicKey(from publicKey: Data) -> OpaquePointer? {
-        return publicKey.withUnsafeBytes({ (bytes) -> OpaquePointer? in
-            var tmp: OpaquePointer?;
-            guard curve_decode_point(&tmp, bytes.baseAddress!.assumingMemoryBound(to: UInt8.self), publicKey.count, nil) >= 0 else {
-                return nil;
-            }
-            return tmp;
-        });
-    }
     
     public static func serialize(publicKeyPointer: OpaquePointer) -> Data? {
         var buffer: OpaquePointer?;
@@ -52,17 +42,14 @@ open class SignalIdentityKey: SignalIdentityKeyProtocol {
         return SignalIdentityKey.serialize(publicKeyPointer: publicKeyPointer);
     }
     
-    public convenience init?(data: Data?) {
-        guard let data = data, let pointer = SignalIdentityKey.publicKey(from: data) else {
-            return nil;
-        }
-        
-        self.init(publicKeyPointer: pointer);
-    }
-    
-    public init(publicKeyPointer: OpaquePointer) {
-        self.publicKeyPointer = publicKeyPointer;
-        signal_type_ref(self.publicKeyPointer);
+    public init(data: Data) throws {
+        self.publicKeyPointer = try data.withUnsafeBytes({ (bytes) throws -> OpaquePointer in
+            var tmp: OpaquePointer?;
+            guard let error = SignalError.from(code: curve_decode_point(&tmp, bytes.baseAddress!.assumingMemoryBound(to: UInt8.self), data.count, nil)) else {
+                return tmp!;
+            }
+            throw error;
+        });
     }
     
     deinit {

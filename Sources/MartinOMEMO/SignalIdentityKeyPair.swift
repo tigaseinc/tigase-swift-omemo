@@ -60,56 +60,50 @@ open class SignalIdentityKeyPair: SignalIdentityKeyProtocol, SignalIdentityKeyPa
         return Data(bytes: signal_buffer_data(buffer), count: signal_buffer_len(buffer));
     }
     
-    public convenience init?(publicKey: Data?, privateKey: Data?) {
-        guard publicKey != nil && privateKey != nil else {
-            return nil;
+    public convenience init(publicKey: Data, privateKey: Data) throws {
+        let privateKeyPointer = try privateKey.withUnsafeBytes({ (bytes) -> OpaquePointer in
+            var tmp: OpaquePointer?;
+            guard let error = SignalError.from(code: curve_decode_private_point(&tmp, bytes.baseAddress!.assumingMemoryBound(to: UInt8.self), privateKey.count, nil)) else {
+                return tmp!;
+            }
+            throw error;
+        });
+        defer {
+            signal_type_unref(privateKeyPointer)
         }
         
-        guard let privateKeyPointer = privateKey!.withUnsafeBytes({ (bytes) -> OpaquePointer? in
+        let publicKeyPointer = try publicKey.withUnsafeBytes({ (bytes) -> OpaquePointer in
             var tmp: OpaquePointer?;
-            guard curve_decode_private_point(&tmp, bytes.baseAddress!.assumingMemoryBound(to: UInt8.self), privateKey!.count, nil) >= 0 else {
-                return nil;
+            guard let error = SignalError.from(code: curve_decode_point(&tmp, bytes.baseAddress!.assumingMemoryBound(to: UInt8.self), publicKey.count, nil)) else {
+                return tmp!;
             }
-            return tmp;
-        }) else {
-            return nil;
-        }
-        
-        guard let publicKeyPointer = publicKey!.withUnsafeBytes({ (bytes) -> OpaquePointer? in
-            var tmp: OpaquePointer?;
-            guard curve_decode_point(&tmp, bytes.baseAddress!.assumingMemoryBound(to: UInt8.self), publicKey!.count, nil) >= 0 else {
-                return nil;
-            }
-            return tmp;
-        }) else {
-            return nil;
+            throw error;
+        })
+        defer {
+            signal_type_unref(publicKeyPointer)
         }
 
         var pointer: OpaquePointer?;
-        ec_key_pair_create(&pointer, publicKeyPointer, privateKeyPointer);
-        signal_type_unref(publicKeyPointer)
-        signal_type_unref(privateKeyPointer)
-        guard let pointer = pointer else {
-            return nil;
+        guard let error = SignalError.from(code: ec_key_pair_create(&pointer, publicKeyPointer, privateKeyPointer)) else {
+            self.init(withKeyPairPointer: pointer!);
+            return;
         }
-        
-        self.init(withKeyPairPointer: pointer);
+
+        throw error;
     }
     
-    public init(withKeyPairPointer keyPairPointer: OpaquePointer) {
+    private init(withKeyPairPointer keyPairPointer: OpaquePointer) {
         self.keyPairPointer = keyPairPointer;
     }
     
-    public convenience init?(fromKeyPairData data: Data) {
-        guard let keyPair = data.withUnsafeBytes({ (bytes) -> OpaquePointer? in
+    public convenience init(fromKeyPairData data: Data) throws {
+        let keyPair = try data.withUnsafeBytes({ (bytes) -> OpaquePointer in
             var tmp: OpaquePointer?;
-            guard ratchet_identity_key_pair_deserialize(&tmp, bytes.baseAddress!.assumingMemoryBound(to: UInt8.self), data.count, nil) >= 0 && tmp != nil else {
-                return nil;
+            guard let error = SignalError.from(code: ratchet_identity_key_pair_deserialize(&tmp, bytes.baseAddress!.assumingMemoryBound(to: UInt8.self), data.count, nil)) else {
+                return tmp!;
             }
-            return tmp;
-        }) else {
-            return nil;
-        }
+            throw error;
+        })
         self.init(withKeyPairPointer: keyPair);
     }
     
@@ -117,13 +111,12 @@ open class SignalIdentityKeyPair: SignalIdentityKeyProtocol, SignalIdentityKeyPa
         signal_type_unref(keyPairPointer);
     }
     
-    public static func generateKeyPair(context: SignalContext) -> SignalIdentityKeyPair? {
+    public static func generateKeyPair(context: SignalContext) throws -> SignalIdentityKeyPair {
         var keyPair: OpaquePointer? = nil;
-        let result = signal_protocol_key_helper_generate_identity_key_pair(&keyPair, context.globalContext);
-        guard result >= 0, let keyPair = keyPair else {
-            return nil;
+        guard let error = SignalError.from(code: signal_protocol_key_helper_generate_identity_key_pair(&keyPair, context.globalContext)) else{
+            return SignalIdentityKeyPair(withKeyPairPointer: keyPair!);
         }
-        return SignalIdentityKeyPair(withKeyPairPointer: keyPair);
+        throw error;
     }
  
     public func serialized() -> Data {

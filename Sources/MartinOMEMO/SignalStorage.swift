@@ -218,6 +218,7 @@ fileprivate func get_sub_device_sessions_func(sessions: UnsafeMutablePointer<Opa
     devices.forEach { device in
         signal_int_list_push_back(list, device);
     }
+    sessions?.initialize(to: list);
     return CInt(devices.count);
 }
 

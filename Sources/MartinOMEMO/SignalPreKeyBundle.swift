@@ -26,35 +26,21 @@ class SignalPreKeyBundle {
     
     let bundle: OpaquePointer;
     
-    public init?(registrationId: UInt32, deviceId: Int32, preKey: OMEMOModule.OMEMOPreKey, bundle: OMEMOModule.OMEMOBundle) {
-        guard let preKeyPublic = SignalIdentityKey.publicKey(from: preKey.data) else {
-            return nil;
-        }
-        guard let signedPreKeyPublic = SignalIdentityKey.publicKey(from: bundle.signedPreKeyPublic) else {
-            signal_type_unref(preKeyPublic);
-            return nil;
-        }
-        guard let identityKey = SignalIdentityKey.publicKey(from: bundle.identityKey) else {
-            signal_type_unref(preKeyPublic);
-            signal_type_unref(signedPreKeyPublic);
-            return nil;
-        }
+    public init(registrationId: UInt32, deviceId: Int32, preKey: OMEMOModule.OMEMOPreKey, bundle: OMEMOModule.OMEMOBundle) throws {
+        let preKeyPublic = try SignalIdentityKey(data: preKey.data);
+        let signedPreKeyPublic = try SignalIdentityKey(data: bundle.signedPreKeyPublic)
+        let identityKey = try SignalIdentityKey(data: bundle.identityKey);
         
         var bundlePtr: OpaquePointer?;
-        guard bundle.signature.withUnsafeBytes({ (bytes) -> Bool in
-            let result = session_pre_key_bundle_create(&bundlePtr, registrationId, deviceId, preKey.preKeyId, preKeyPublic, bundle.signedPreKeyId, signedPreKeyPublic, bytes.baseAddress?.assumingMemoryBound(to: UInt8.self), bundle.signature.count, identityKey);
-            signal_type_unref(preKeyPublic);
-            signal_type_unref(signedPreKeyPublic);
-            signal_type_unref(identityKey);
-            
-            return result >= 0;
+        guard let error = bundle.signature.withUnsafeBytes({ (bytes) -> SignalError? in
+            return SignalError.from(code: session_pre_key_bundle_create(&bundlePtr, registrationId, deviceId, preKey.preKeyId, preKeyPublic.publicKeyPointer, bundle.signedPreKeyId, signedPreKeyPublic.publicKeyPointer, bytes.baseAddress?.assumingMemoryBound(to: UInt8.self), bundle.signature.count, identityKey.publicKeyPointer));
         }) else {
-            return nil;
+            self.bundle = bundlePtr!;
+            return;
         }
         
-        // TODO: should we check validity? if so then we should do this here!
+        throw error;
         
-        self.bundle = bundlePtr!;
     }
  
     deinit {

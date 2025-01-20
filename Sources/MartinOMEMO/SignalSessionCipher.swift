@@ -24,108 +24,96 @@ import libsignal
 
 open class SignalSessionCipher {
     
-    fileprivate var cipher: OpaquePointer;
-    fileprivate let context: SignalContext;
-    fileprivate let address: SignalAddress;
+    private let cipher: OpaquePointer;
+    private let context: SignalContext;
+    private let address: SignalAddress;
     
-    public init?(withAddress address: SignalAddress, andContext context: SignalContext) {
+    public init(withAddress address: SignalAddress, andContext context: SignalContext) throws {
+        guard let storage = context.storage else {
+            fatalError("Storage not initialized")
+        }
         var cipher: OpaquePointer?;
         self.address = address;
-        guard let storage = context.storage, session_cipher_create(&cipher, storage.storeContext, self.address.address, context.globalContext) >= 0 && cipher != nil else {
-            return nil;
+        guard let error = SignalError.from(code: session_cipher_create(&cipher, storage.storeContext, self.address.address, context.globalContext)) else {
+            self.context = context;
+            self.cipher = cipher!;
+            return;
         }
-        self.context = context;
-        self.cipher = cipher!;
+        throw error;
     }
     
     deinit {
         session_cipher_free(cipher);
     }
     
-    func encrypt(data: Data) -> Result<Key,SignalError> {
+    func encrypt(data: Data) throws -> Key {
         var message: OpaquePointer?;
-        let error = data.withUnsafeBytes({ (bytes) -> SignalError? in
+        guard let error = data.withUnsafeBytes({ (bytes) -> SignalError? in
             return SignalError.from(code : session_cipher_encrypt(cipher, bytes.baseAddress!.assumingMemoryBound(to: UInt8.self), data.count, &message));
-        })
-        guard error == nil && message != nil else {
-            return .failure(error ?? .unknown);
+        }) else {
+            let serialized = ciphertext_message_get_serialized(message);
+            let result = Data(bytes: signal_buffer_data(serialized), count: signal_buffer_len(serialized));
+            
+            defer {
+                signal_type_unref(message);
+            }
+            return Key(key: result, deviceId: address.deviceId, prekey: ciphertext_message_get_type(message) == CIPHERTEXT_PREKEY_TYPE);
         }
-        
-        let serialized = ciphertext_message_get_serialized(message);
-        let result = Data(bytes: signal_buffer_data(serialized), count: signal_buffer_len(serialized));
-        
-        defer {
-            signal_type_unref(message);
-        }
-        return .success(Key(key: result, deviceId: address.deviceId, prekey: ciphertext_message_get_type(message) == CIPHERTEXT_PREKEY_TYPE));
+        throw error;
     }
  
-    func decrypt(key: Key) -> Result<Data, SignalError> {
+    func decrypt(key: Key) throws -> Data {
         if key.prekey {
-            return decryptPreKeyMessage(key: key);
+            return try decryptPreKeyMessage(key: key);
         } else {
-            return decryptSignalMessage(key: key);
+            return try decryptSignalMessage(key: key);
         }
     }
     
-    fileprivate func decryptPreKeyMessage(key: Key) -> Result<Data,SignalError> {
-        let result = key.key.withUnsafeBytes({ (bytes) -> Result<OpaquePointer, SignalError> in
+    private func decryptPreKeyMessage(key: Key) throws -> Data {
+        let decryptedPreKeySignalMessage = try key.key.withUnsafeBytes({ (bytes) throws -> OpaquePointer in
             var output: OpaquePointer?;
             var preKeySignalMessage: OpaquePointer?;
             
-            var error = SignalError.from(code: pre_key_signal_message_deserialize(&preKeySignalMessage, bytes.baseAddress!.assumingMemoryBound(to: UInt8.self), key.key.count, self.context.globalContext));
-            guard error == nil && preKeySignalMessage != nil else {
-                return .failure(error ?? .unknown);
+            guard let error = SignalError.from(code: pre_key_signal_message_deserialize(&preKeySignalMessage, bytes.baseAddress!.assumingMemoryBound(to: UInt8.self), key.key.count, self.context.globalContext)) else {
+                defer {
+                    signal_type_unref(preKeySignalMessage);
+                }
+                guard let error = SignalError.from(code: session_cipher_decrypt_pre_key_signal_message(cipher, preKeySignalMessage, nil, &output)) else {
+                    return output!;
+                }
+                throw error;
             }
-            defer {
-                signal_type_unref(preKeySignalMessage);
-            }
-            error = SignalError.from(code: session_cipher_decrypt_pre_key_signal_message(cipher, preKeySignalMessage, nil, &output));
-            guard error == nil && output != nil else {
-                return .failure(error ?? .unknown);
-            }
-            return .success(output!);
+            throw error;
         })
-        switch result {
-        case .failure(let error):
-            return .failure(error);
-        case .success(let preKeySignalMessage):
-            defer {
-                signal_buffer_free(preKeySignalMessage);
-            }
-            return .success(Data(bytes: signal_buffer_data(preKeySignalMessage), count: signal_buffer_len(preKeySignalMessage)));
+        defer {
+            signal_buffer_free(decryptedPreKeySignalMessage);
         }
+        return Data(bytes: signal_buffer_data(decryptedPreKeySignalMessage), count: signal_buffer_len(decryptedPreKeySignalMessage));
     }
     
-    fileprivate func decryptSignalMessage(key: Key) -> Result<Data, SignalError> {
-        let result = key.key.withUnsafeBytes({ (bytes) -> Result<OpaquePointer,SignalError> in
+    private func decryptSignalMessage(key: Key) throws -> Data {
+        let descryptedSignalMessage = try key.key.withUnsafeBytes({ (bytes) throws -> OpaquePointer in
             var output: OpaquePointer?;
             var signalMessage: OpaquePointer?;
-            var error = SignalError.from(code: signal_message_deserialize(&signalMessage, bytes.baseAddress!.assumingMemoryBound(to: UInt8.self), key.key.count, self.context.globalContext));
-            guard error == nil && signalMessage != nil else {
-                return .failure(error ?? .unknown);
+            guard let error = SignalError.from(code: signal_message_deserialize(&signalMessage, bytes.baseAddress!.assumingMemoryBound(to: UInt8.self), key.key.count, self.context.globalContext)) else {
+                defer {
+                    signal_type_unref(signalMessage);
+                }
+                guard let error = SignalError.from(code: session_cipher_decrypt_signal_message(cipher, signalMessage, nil, &output)) else {
+                    return output!;
+                }
+                throw error;
             }
-            defer {
-                signal_type_unref(signalMessage);
-            }
-            error = SignalError.from(code: session_cipher_decrypt_signal_message(cipher, signalMessage, nil, &output));
-            guard error == nil && output != nil else {
-                return .failure(error ?? .unknown);
-            }
-            return .success(output!);
+            throw error;
         });
-        switch result {
-        case .failure(let error):
-            return .failure(error);
-        case .success(let signalMessage):
-            defer {
-                signal_buffer_free(signalMessage);
-            }
-            return .success(Data(bytes: signal_buffer_data(signalMessage), count: signal_buffer_len(signalMessage)));
+        defer {
+            signal_buffer_free(descryptedSignalMessage);
         }
+        return Data(bytes: signal_buffer_data(descryptedSignalMessage), count: signal_buffer_len(descryptedSignalMessage));
     }
     
-    open class Key {
+    public struct Key: Equatable, Hashable {
         
         public let key: Data;
         public let deviceId: Int32;
