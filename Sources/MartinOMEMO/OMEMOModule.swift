@@ -155,7 +155,7 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
             } catch {
                 logger.error("failed to decrypt key from: \(senderAddress): \(error)")
                 switch error as? SignalError {
-                case .invalidMessage, .noSession:
+                case .invalidMessage, .noSession, .invalidKeyId:
                     healFn();
                 default:
                     break;
@@ -222,10 +222,6 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
             throw SignalError.invalidArgument;
         }
         
-        guard let payloadValue = encryptedEl.firstChild(name: "payload")?.value, let payload = Data(base64Encoded: payloadValue) else {
-            return .transportKey(TransportKey(key: decryptedKey.data, iv: iv));
-        }
-        
         if decryptedKey.isPreKey {
             // pre key was removed so we need to republish the bundle!
             Task {
@@ -238,6 +234,10 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
             }
         }
 
+        guard let payloadValue = encryptedEl.firstChild(name: "payload")?.value, let payload = Data(base64Encoded: payloadValue) else {
+            return .transportKey(TransportKey(key: decryptedKey.data, iv: iv));
+        }
+        
         let body = try decrypt(payload: payload, iv: iv, key: decryptedKey);
         message.removeChild(encryptedEl);
         message.body = body;
@@ -381,6 +381,14 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
         return (sealed.ciphertext + sealed.tag, combinedKey.hex());
     }
     
+    private func _encryptBody(_ body: String?, for key: SymmetricKey, nonce: AES.GCM.Nonce) -> (String?,Data) {
+        if let data = body?.data(using: .utf8), let sealed = try? AES.GCM.seal(data, using: key, nonce: nonce) {
+            return (sealed.ciphertext.base64EncodedString(), key.data() + sealed.tag);
+        } else {
+            return (nil, key.data());
+        }
+    }
+    
     private func _encrypt(message: Message, for remoteAddresses: [SignalAddress], forSelf: Bool = true) throws -> EncryptedMessage {
         guard let context = self.context, let storage = signalContext.storage else {
             throw SignalError.unknown;
@@ -388,14 +396,15 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
         
         let key = SymmetricKey(size: .bits128);
         let encryptedEl = Element(name: "encrypted", xmlns: OMEMOModule.XMLNS);
-
-        guard let data = message.body?.data(using: .utf8), let sealed = try? AES.GCM.seal(data, using: key) else {
-            throw SignalError.notEncrypted;
+        
+        //        guard let data = message.body?.data(using: .utf8), let sealed = try? AES.GCM.seal(data, using: key) else {
+        //            throw SignalError.notEncrypted;
+        //        }
+        let nonce = AES.GCM.Nonce();
+        let (payload, combinedKey) = _encryptBody(message.body, for: key, nonce: nonce);
+        if let payload = payload {
+            encryptedEl.addChild(Element(name: "payload", cdata: payload));
         }
-                    
-        encryptedEl.addChild(Element(name: "payload", cdata: sealed.ciphertext.base64EncodedString()));
-                
-        let combinedKey = key.data() + sealed.tag;
         let header = Element(name: "header");
         header.attribute("sid", newValue: String(storage.identityKeyStore.localRegistrationId()));
         encryptedEl.addChild(header);
@@ -421,7 +430,7 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
             }
             return keyEl;
         }));
-        header.addChild(Element(name: "iv", cdata: Data(sealed.nonce).base64EncodedString()));
+        header.addChild(Element(name: "iv", cdata: Data(nonce).base64EncodedString()));
 
         message.body = nil;
         message.addChild(Element(name: "store", xmlns: "urn:xmpp:hints"));
@@ -735,6 +744,11 @@ open class OMEMOModule: AbstractPEPModule, XmppModule, Resetable, @unchecked Sen
             return;
         }
         _ = try await pubsubModule.publishItem(at: nil, to: bundleNode(for: storage.identityKeyStore.localRegistrationId()), itemId: "current", payload: bundleEl, publishOptions: publishOptions);
+    }
+    
+    public func regenerateSession(forAddress address: SignalAddress) async throws {
+        await buildSession(forAddress: address)
+        completeSession(forAddress: address);
     }
     
     private func completeSession(forAddress address: SignalAddress) {
