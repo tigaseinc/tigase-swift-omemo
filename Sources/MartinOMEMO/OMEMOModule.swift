@@ -24,7 +24,7 @@ import Martin
 import libsignal
 import Combine
 import CryptoKit
-import TigaseLogging
+import os
 
 extension XmppModuleIdentifier {
     public static var omemo: XmppModuleIdentifier<OMEMOModule> {
